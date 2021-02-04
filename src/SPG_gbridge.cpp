@@ -1,26 +1,30 @@
 #include <RcppArmadillo.h>
 // [[Rcpp::depends( RcppArmadillo)]]
 // [[Rcpp::export]]
-Rcpp::List SPG(arma::mat W, arma::vec y, arma::mat Sigma, arma::vec sizes,
-               double z, double lambda0,
-               double gamma, double a_min, double a_max, double sig1,
-               double sig2, int Msave, int max1, int max2, double tol,
-               Rcpp::Function L12proj){
-  arma::vec start_idx = cumsum(sizes)-sizes;
-  arma::vec end_idx   = cumsum(sizes)-1;
-  int M               = start_idx.n_elem;
-  int p               = W.n_cols;
+arma::vec spgaug(arma::mat W, arma::vec y, arma::mat Sigma, arma::vec sizes,
+                 double z, arma::vec theta, arma::vec start,
+                 double gamma, double a_min, double a_max, double sig1,
+                 double sig2, int Msave, int max1, int max2, double tol,
+                 Rcpp::Function L1proj){
+  arma::vec start_idx  = cumsum(sizes)-sizes;
+  arma::vec end_idx    = cumsum(sizes)-1;
+  int M                = start_idx.n_elem;
+  int p                = W.n_cols;
 
   // initialization
   arma::vec eta = arma::zeros(M*p);
+  if(is_finite(start)) eta = start;
   arma::cube wtw = arma::zeros(p,p,M);
   arma::cube wty = arma::zeros(p,1,M);
   for(int m = 0; m < M; ++m){
     arma::mat w_m = W.rows(start_idx(m),end_idx(m));
     arma::vec y_m = y.subvec(start_idx(m),end_idx(m));
     wtw.slice(m) = w_m.t()*w_m/sizes(m) - Sigma;
-    wty.slice(m) = w_m.t()*y_m/sizes(m);
+    for(int i=0; i<p; ++i) wtw.slice(m).col(i) = theta % wtw.slice(m).col(i);
+    for(int j=0; j<p; ++j) wtw.slice(m).row(j) = theta.t() % wtw.slice(m).row(j);
+    wty.slice(m) = (theta % (w_m.t()*y_m))/sizes(m);
   }
+
   // initial value of alpha
   arma::vec df = arma::zeros(M*p);
   for(int m = 0; m < M; ++m){
@@ -28,7 +32,7 @@ Rcpp::List SPG(arma::mat W, arma::vec y, arma::mat Sigma, arma::vec sizes,
     df.subvec(m*p, (m+1)*p-1) = wtw.slice(m)*eta_m - wty.slice(m);
   }
   Rcpp::NumericVector etadf = Rcpp::wrap(eta-df);
-  Rcpp::NumericVector proj = L12proj(etadf, M, p, z, lambda0);
+  Rcpp::NumericVector proj = L1proj(etadf, 1e30, 1);
   arma::vec arma_proj = Rcpp::as<arma::vec>(proj);
   arma::vec g1 = arma_proj - eta;
   double g1max = max(abs(g1));
@@ -38,7 +42,8 @@ Rcpp::List SPG(arma::mat W, arma::vec y, arma::mat Sigma, arma::vec sizes,
   // main part of algorithm
   int iter = 0;
   int evaltime = 0;
-  arma::vec fsave = arma::zeros(Msave);
+  arma::vec fsave = arma::ones(Msave) * (-1e30);
+
   int fcount = 0;
   while(iter < max1 && evaltime < max2){
     // check if stationary
@@ -48,7 +53,7 @@ Rcpp::List SPG(arma::mat W, arma::vec y, arma::mat Sigma, arma::vec sizes,
       df.subvec(m*p, (m+1)*p-1) = wtw.slice(m)*eta_m - wty.slice(m);
     }
     Rcpp::NumericVector etadf = Rcpp::wrap(eta-df);
-    Rcpp::NumericVector proj = L12proj(etadf, M, p, z, lambda0);
+    Rcpp::NumericVector proj = L1proj(etadf, 1e30, 1);
     arma::vec arma_proj = Rcpp::as<arma::vec>(proj);
     g1 = arma_proj - eta;
     g1max = max(abs(g1));
@@ -57,7 +62,7 @@ Rcpp::List SPG(arma::mat W, arma::vec y, arma::mat Sigma, arma::vec sizes,
     // backtracking
     double lambda= 1;
     Rcpp::NumericVector etadf1 = Rcpp::wrap(eta-alpha*df);
-    Rcpp::NumericVector proj1 = L12proj(etadf1, M, p, z, lambda0);
+    Rcpp::NumericVector proj1 = L1proj(etadf1, 1e30, 1);
     arma::vec arma_proj1 = Rcpp::as<arma::vec>(proj1);
     arma::vec dk = arma_proj1 - eta;
     arma::mat feta = arma::zeros(1,1);
@@ -113,18 +118,79 @@ Rcpp::List SPG(arma::mat W, arma::vec y, arma::mat Sigma, arma::vec sizes,
     if(bk<=0) alpha = a_max;
     else{
       double ak = sum(sk % sk);
-      double compare = ak/bk;
-      if(compare<a_min) compare = a_min;
-      if(compare>a_max) compare = a_max;
+      alpha = ak/bk;
+      if(alpha<a_min) alpha = a_min;
+      if(alpha>a_max) alpha = a_max;
     }
 
     iter++;
   }
 
+  //from above we have eta.star, now get back to eta with L1 constraint at z
+  arma::vec eta0 = arma::zeros(M*p);
+  for(int m = 0; m < M; ++m){
+    eta0.subvec(m*p, (m+1)*p-1) = theta % eta.subvec(m*p, (m+1)*p-1);
+  }
+  Rcpp::NumericVector etainput = Rcpp::wrap(eta0);
+  Rcpp::NumericVector etaproj = L1proj(etainput, z, 0);
+  eta = Rcpp::as<arma::vec>(etaproj);
+
+  return eta;
+}
+
+
+// function to perform optimization with group bridge penalty
+// [[Rcpp::depends( RcppArmadillo)]]
+// [[Rcpp::export]]
+Rcpp::List SPG_gbridge(arma::mat W, arma::vec y, arma::mat Sigma, arma::vec sizes,
+                       double z, double lambda0, arma::vec init,
+                       int maxiter, double tol0,
+                       double gamma, double a_min, double a_max, double sig1,
+                       double sig2, int Msave, int max1, int max2, double tol,
+                       Rcpp::Function L1proj){
+  int M = sizes.n_elem;
+  int p = W.n_cols;
+
+  // initialization
+  arma::vec eta = arma::zeros(M*p);
+  if(is_finite(init)) eta = init;
+
+  int iter = 0;
+  double diff = 1;
+  while(iter<=maxiter){
+    arma::mat mat_eta(eta);
+    mat_eta.reshape(p,M);
+
+    // update augmented parameter theta
+    arma::vec theta = lambda0*sqrt(sum(abs(mat_eta),1));
+
+    // update eta with spgaug
+    arma::vec eta_new = spgaug(W,y,Sigma,sizes,z,theta,eta,
+                               gamma,a_min,a_max,sig1,sig2,Msave,max1,max2,tol,
+                               L1proj);
+    diff = max(abs(eta_new - eta));
+    eta = eta_new;
+    if(diff<tol0) break;
+    iter++;
+  }
+
+  // convergence evaluation
+  int iteration = 0;
+  int convergence = 0;
+  if(iter==1){
+    iteration = iter;
+  }else{
+    if(iter>maxiter) iteration = iter-1;
+    else{
+      iteration = iter;
+      convergence = 1;
+    }
+  }
+
   return Rcpp::List::create(Rcpp::Named("eta")         = eta,
                             Rcpp::Named("z")           = z,
                             Rcpp::Named("lambda0")     = lambda0,
-                            Rcpp::Named("iter")        = iter,
-                            Rcpp::Named("evaltime")    = evaltime,
-                            Rcpp::Named("g1max")       = g1max);
+                            Rcpp::Named("iteration")   = iteration,
+                            Rcpp::Named("convergence") = convergence,
+                            Rcpp::Named("diff")        = diff);
 }
